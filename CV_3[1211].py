@@ -1,0 +1,165 @@
+import numpy as np
+import cv2
+
+
+# Define a function to arrange matching pairs of keypoints between two images
+def arrangePairs(goodMatches, kpsA, kpsB):
+    setA = []
+    setB = []
+    for match in goodMatches:
+        setA.append(kpsA[match.queryIdx].pt)
+        setB.append(kpsB[match.trainIdx].pt)
+    return (setA, setB)
+
+
+# Define a function to apply transformation to a set of points
+def applyTransformation(T, set):
+    transformedSet = []
+    for x, y in set:
+        x_new = T[0][0] * x + T[0][1] * y + T[0][2]
+        y_new = T[1][0] * x + T[1][1] * y + T[1][2]
+        transformedSet.append([x_new, y_new])
+    return transformedSet
+
+
+# Define a function to calculate the number of inliers after transformation
+def calculateInliers(transformation, setA, setB, th=10):
+    inliers = 0
+    for i in range(len(setA)):
+        x, y = setA[i]
+        x_new = (
+            transformation[0][0] * x + transformation[0][1] * y + transformation[0][2]
+        )
+        y_new = (
+            transformation[1][0] * x + transformation[1][1] * y + transformation[1][2]
+        )
+        x_b, y_b = setB[i]
+        distance = np.sqrt((x_new - x_b) ** 2 + (y_new - y_b) ** 2)
+        if distance < th:
+            inliers += 1
+    return inliers
+
+
+# Define a function to warp the second image and merge it with the first image using homography
+def warpTwoImages(img1, img2, H):
+    h1, w1 = img1.shape[:2]
+    h2, w2 = img2.shape[:2]
+    pts1 = np.float32([[0, 0], [0, h1], [w1, h1], [w1, 0]]).reshape(-1, 1, 2)
+    pts2 = np.float32([[0, 0], [0, h2], [w2, h2], [w2, 0]]).reshape(-1, 1, 2)
+    pts2_ = cv2.perspectiveTransform(pts2, H)
+    pts = np.concatenate((pts1, pts2_), axis=0)
+    [xmin, ymin] = np.int32(pts.min(axis=0).ravel() - 0.5)
+    [xmax, ymax] = np.int32(pts.max(axis=0).ravel() + 0.5)
+    t = [-xmin, -ymin]
+    Ht = np.array([[1, 0, t[0]], [0, 1, t[1]], [0, 0, 1]])  # translate
+
+    result = cv2.warpPerspective(img2, Ht.dot(H), (xmax - xmin, ymax - ymin))
+    result[t[1] : h1 + t[1], t[0] : w1 + t[0]] = img1
+    return result
+
+
+# Define a function to estimate the transformation between two sets of points
+def estimateTransformation(setA, setB):
+    maxInliers = 0
+    maxInlierTransformation = []
+
+    for i in range(50):
+        # Select random points from setA and setB
+        random_indices = np.random.choice(len(setA), 10)
+        temp_setA = [setA[i] for i in random_indices]
+        temp_setB = [setB[i] for i in random_indices]
+
+        M = []
+        # Create the transformation matrix
+        for x, y in temp_setA:
+            row1 = [x, y, 0, 0, 1, 0]
+            row2 = [0, 0, x, y, 0, 1]
+            M.extend([row1, row2])
+
+        M = np.tile(M, (1, 1))
+
+        A = M.copy()
+        B = []
+        for x, y in temp_setB:
+            B.append(x)
+            B.append(y)
+
+        # Calculate the coefficients using the normal equation
+        A_t = np.transpose(A)
+        A_t_A = np.dot(A_t, A)
+        A_t_b = np.dot(A_t, B)
+        coefficients = np.dot(np.linalg.inv(A_t_A), A_t_b)
+        transformation = np.array(
+            [
+                [coefficients[0], coefficients[1], coefficients[4]],
+                [coefficients[2], coefficients[3], coefficients[5]],
+            ]
+        )
+        inliers = calculateInliers(transformation, setA, setB)
+        if inliers > maxInliers:
+            maxInliers = inliers
+            maxInlierTransformation = transformation
+
+    maxInlierTransformation = np.vstack([maxInlierTransformation, [0, 0, 1]])
+    return maxInlierTransformation
+
+
+# Read the images and convert them to grayscale
+imageA = cv2.imread("./ImageA.jpg")
+imageB = cv2.imread("./ImageB.jpg")
+imageA_gray = cv2.cvtColor(imageA, cv2.COLOR_BGR2GRAY)
+imageB_gray = cv2.cvtColor(imageB, cv2.COLOR_BGR2GRAY)
+
+# Extract features using SIFT
+descriptor = cv2.xfeatures2d.SIFT_create()
+(kpsA, descriptorsA) = descriptor.detectAndCompute(imageA_gray, None)
+(kpsB, descriptorsB) = descriptor.detectAndCompute(imageB_gray, None)
+
+# Match features between images using BFMatcher
+bf = cv2.BFMatcher()
+matches = bf.knnMatch(descriptorsA, descriptorsB, k=2)
+
+goodMatches = []
+for m, n in matches:
+    if m.distance / n.distance < 0.8:
+        goodMatches.append(m)
+
+setA, setB = arrangePairs(goodMatches, kpsA, kpsB)
+matched_image = cv2.drawMatches(
+    imageA,
+    kpsA,
+    imageB,
+    kpsB,
+    goodMatches,
+    None,
+    flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS,
+)
+cv2.imshow("Matched Image", matched_image)
+
+# Estimate the homography matrix
+homography, mask = cv2.findHomography(np.array(setB), np.array(setA), cv2.RANSAC, 5.0)
+blended_image = warpTwoImages(imageA, imageB, homography)
+cv2.imshow("Blended Image", blended_image)
+
+# Estimate the transformation between the sets of points
+transformation = estimateTransformation(setB, setA)
+
+# Warp the first image based on the estimated transformation
+imageA_transformed = imageA.copy()
+cv2.warpPerspective(
+    imageA,
+    transformation,
+    (imageA.shape[1], imageA.shape[0]),
+    imageA_transformed,
+    cv2.INTER_LINEAR,
+    cv2.BORDER_CONSTANT,
+    0,
+)
+
+# Merge the two images using the estimated transformation
+blended_image = warpTwoImages(imageA, imageB, transformation)
+cv2.imshow("Blended Image", blended_image)
+
+# Wait for a key press and close all OpenCV windows
+cv2.waitKey(0)
+cv2.destroyAllWindows()
